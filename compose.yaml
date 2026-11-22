@@ -1,0 +1,12 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      VOCAB_SIZE: "64"   # 词表大小（词元取值 0..63）
+      D_MODEL: "32"      # 注意力维度
+      BLOCK_SIZE: "4"    # 每块词元数
+      NUM_BLOCKS: "32"   # 物理块总数（容量上限）
+      SEED: "1234"       # 固定权重的随机种子
+    restart: unless-stopped

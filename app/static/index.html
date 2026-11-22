@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KV-Cache 分叉对比</title>
+<style>
+  :root { --bd:#d0d7de; --bg:#f6f8fa; --fg:#1f2328; --accent:#0969da; }
+  * { box-sizing: border-box; }
+  body { font-family: ui-sans-serif, system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; color: var(--fg); background: var(--bg); }
+  header { background:#fff; border-bottom:1px solid var(--bd); padding:10px 20px;
+           display:flex; align-items:center; gap:24px; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; }
+  main { max-width:1100px; margin:16px auto; padding:0 16px; }
+  section { background:#fff; border:1px solid var(--bd); border-radius:8px;
+            padding:14px 16px; margin-bottom:14px; }
+  h2 { font-size:15px; margin:0 0 10px; }
+  h3 { font-size:13px; margin:12px 0 6px; color:#57606a; }
+  input, button { font:inherit; padding:6px 10px; border:1px solid var(--bd);
+                  border-radius:6px; }
+  input { width:260px; }
+  button { background:var(--accent); color:#fff; border-color:var(--accent); cursor:pointer; }
+  button.ghost { background:#fff; color:var(--fg); }
+  button.danger { background:#cf222e; border-color:#cf222e; }
+  button:disabled { opacity:.5; cursor:default; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { border-bottom:1px solid var(--bd); padding:6px 8px; text-align:left; }
+  tr.sel { background:#ddf4ff; }
+  tr:hover { background:#f6f8fa; }
+  code { background:#eff1f3; padding:1px 5px; border-radius:4px; font-size:12px; }
+  .occ-wrap { flex:1; min-width:220px; }
+  .occ-bar { height:10px; background:#eaeef2; border-radius:5px; overflow:hidden; }
+  .occ-bar > div { height:100%; background:var(--accent); transition:width .3s; }
+  .muted { color:#57606a; font-size:12px; }
+  #toast { position:fixed; right:16px; bottom:16px; max-width:420px; }
+  .toast { background:#ffebe9; border:1px solid #cf222e; color:#cf222e; padding:10px 14px;
+           border-radius:8px; margin-top:8px; font-size:13px; }
+  .toast.ok { background:#dafbe1; border-color:#1a7f37; color:#1a7f37; }
+  .grid { display:flex; flex-wrap:wrap; gap:6px; }
+  .blk { width:52px; height:40px; border-radius:6px; border:1px solid var(--bd);
+         display:flex; flex-direction:column; align-items:center; justify-content:center;
+         font-size:11px; background:#ddf4ff; }
+  .blk.free { background:#f0f1f3; color:#8c959f; }
+  .blk.shared { background:#fff8c5; border-color:#d4a72c; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .pill { display:inline-block; background:#eff1f3; border-radius:10px; padding:1px 8px;
+          font-size:12px; margin-right:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🌿 KV-Cache 分叉对比</h1>
+  <div class="occ-wrap">
+    <div class="muted" id="occ-text">块占用 …</div>
+    <div class="occ-bar"><div id="occ-fill" style="width:0%"></div></div>
+  </div>
+  <div class="muted" id="cfg"></div>
+</header>
+<main>
+  <section>
+    <h2>新建会话</h2>
+    <div class="row">
+      <input id="init-tokens" placeholder="整数词元，空格/逗号分隔，如：1 2 3 4 5">
+      <button id="btn-create">建会话</button>
+      <span class="muted" id="vocab-hint"></span>
+    </div>
+  </section>
+
+  <section id="action-panel" style="display:none">
+    <h2>分支操作：<code id="sel-label"></code></h2>
+    <div class="row">
+      <input id="append-tokens" placeholder="追加词元，如：7 8 9">
+      <button id="btn-append">追加并预测</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <input id="fork-pos" type="number" min="0" placeholder="分叉点位置" style="width:140px">
+      <button id="btn-fork" class="ghost">在此处分叉</button>
+      <button id="btn-close" class="danger">关闭该分支</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>会话与分支</h2>
+    <div id="sessions"><span class="muted">暂无会话</span></div>
+  </section>
+
+  <section>
+    <h2>物理块占用</h2>
+    <div class="grid" id="block-grid"></div>
+    <div class="muted" style="margin-top:6px">灰=空闲　蓝=独占　黄=共享(数字为引用计数)</div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+let selected = null; // {sessionId, branchId, label}
+
+function toast(msg, ok=false) {
+  const el = document.createElement('div');
+  el.className = 'toast' + (ok ? ' ok' : '');
+  el.textContent = msg;
+  document.getElementById('toast').appendChild(el);
+  setTimeout(() => el.remove(), 5000);
+}
+
+function parseTokens(s) {
+  const parts = s.split(/[\s,，]+/).filter(x => x.length > 0);
+  if (!parts.length) throw new Error('请输入至少一个词元');
+  return parts.map(x => {
+    const n = Number(x);
+    if (!Number.isInteger(n)) throw new Error(`「${x}」不是整数`);
+    return n;
+  });
+}
+
+async function api(path, opts={}) {
+  const r = await fetch(path, {headers: {'Content-Type': 'application/json'}, ...opts});
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.detail || `HTTP ${r.status}`);
+  return body;
+}
+
+async function refresh() {
+  try {
+    const [stats, sessions] = await Promise.all([
+      api('/api/stats'), api('/api/sessions')
+    ]);
+    renderStats(stats);
+    await renderSessions(sessions.sessions);
+  } catch (e) { toast(e.message); }
+}
+
+function renderStats(s) {
+  document.getElementById('occ-text').textContent =
+    `块占用 ${s.used_blocks}/${s.num_blocks}（空闲 ${s.free_blocks}，每块 ${s.block_size} 词元）`;
+  document.getElementById('occ-fill').style.width =
+    (100 * s.used_blocks / s.num_blocks) + '%';
+  document.getElementById('cfg').textContent =
+    `词表 ${s.vocab_size} · 维度 ${s.d_model}`;
+  document.getElementById('vocab-hint').textContent =
+    `词元取值 0 ~ ${s.vocab_size - 1}`;
+  const grid = document.getElementById('block-grid');
+  grid.innerHTML = '';
+  for (const b of s.blocks) {
+    const d = document.createElement('div');
+    d.className = 'blk' + (b.refcount === 0 ? ' free' : (b.refcount > 1 ? ' shared' : ''));
+    d.innerHTML = b.refcount === 0 ? `<span>#${b.id}</span><span>空闲</span>`
+                                   : `<span>#${b.id}</span><span>×${b.refcount}</span>`;
+    grid.appendChild(d);
+  }
+}
+
+async function renderSessions(list) {
+  const box = document.getElementById('sessions');
+  if (!list.length) { box.innerHTML = '<span class="muted">暂无会话</span>'; return; }
+  box.innerHTML = '';
+  for (const s of list) {
+    const detail = await api(`/api/sessions/${s.session_id}`);
+    const card = document.createElement('div');
+    card.style.marginBottom = '12px';
+    let html = `<h3>会话 <code>${s.session_id}</code>
+      <button class="ghost" data-del-session="${s.session_id}" style="float:right">删除会话</button></h3>`;
+    if (!detail.branches.length) {
+      html += '<div class="muted">（无分支）</div>';
+    } else {
+      html += `<table><tr><th></th><th>分支</th><th>长度</th><th>词元</th>
+               <th>占用块</th><th>下一词元预测</th></tr>`;
+      for (const b of detail.branches) {
+        const p = b.prediction && b.prediction.argmax !== null
+          ? `<b>${b.prediction.argmax}</b>（${(b.prediction.top[0].prob*100).toFixed(1)}%）` +
+            `<span class="muted" title="${b.prediction.top.map(t=>t.token+': '+(t.prob*100).toFixed(1)+'%').join('  ')}">　top5⯈</span>`
+          : '<span class="muted">—</span>';
+        const isSel = selected && selected.branchId === b.id;
+        html += `<tr class="${isSel ? 'sel' : ''}">
+          <td><button class="ghost" data-sel="${s.session_id}|${b.id}|${b.name}">${isSel ? '✔' : '选择'}</button></td>
+          <td><code>${b.name}</code></td><td>${b.length}</td>
+          <td>${b.tokens.map(t=>`<span class="pill">${t}</span>`).join('')}</td>
+          <td>${b.block_ids.map(i=>`#${i}`).join(' ') || '—'}</td>
+          <td>${p}</td></tr>`;
+      }
+      html += '</table>';
+    }
+    card.innerHTML = html;
+    box.appendChild(card);
+  }
+}
+
+document.addEventListener('click', async e => {
+  const t = e.target;
+  try {
+    if (t.dataset.sel) {
+      const [sessionId, branchId, label] = t.dataset.sel.split('|');
+      selected = {sessionId, branchId, label};
+      document.getElementById('action-panel').style.display = 'block';
+      document.getElementById('sel-label').textContent = `${label}（会话 ${sessionId}）`;
+      refresh();
+    } else if (t.dataset.delSession) {
+      await api(`/api/sessions/${t.dataset.delSession}`, {method: 'DELETE'});
+      selected = null;
+      document.getElementById('action-panel').style.display = 'none';
+      toast('会话已删除', true); refresh();
+    } else if (t.id === 'btn-create') {
+      const tokens = parseTokens(document.getElementById('init-tokens').value);
+      await api('/api/sessions', {method: 'POST', body: JSON.stringify({tokens})});
+      document.getElementById('init-tokens').value = '';
+      toast('会话已创建', true); refresh();
+    } else if (t.id === 'btn-append') {
+      if (!selected) return;
+      const tokens = parseTokens(document.getElementById('append-tokens').value);
+      const r = await api(`/api/sessions/${selected.sessionId}/append`,
+        {method: 'POST', body: JSON.stringify({branch_id: selected.branchId, tokens})});
+      document.getElementById('append-tokens').value = '';
+      toast(`追加成功，下一词元预测：${r.branch.prediction.argmax}`, true); refresh();
+    } else if (t.id === 'btn-fork') {
+      if (!selected) return;
+      const raw = document.getElementById('fork-pos').value;
+      if (raw === '') throw new Error('请填写分叉点位置（整数）');
+      const pos = Number(raw);
+      if (!Number.isInteger(pos)) throw new Error('请填写分叉点位置（整数）');
+      const r = await api(`/api/sessions/${selected.sessionId}/fork`,
+        {method: 'POST', body: JSON.stringify({branch_id: selected.branchId, position: pos})});
+      toast(`已分叉出 ${r.branch.name}`, true); refresh();
+    } else if (t.id === 'btn-close') {
+      if (!selected) return;
+      await api(`/api/sessions/${selected.sessionId}/branches/${selected.branchId}`,
+        {method: 'DELETE'});
+      selected = null;
+      document.getElementById('action-panel').style.display = 'none';
+      toast('分支已关闭，无引用的块已回收', true); refresh();
+    }
+  } catch (err) { toast(err.message); }
+});
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
