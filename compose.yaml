@@ -9,4 +9,10 @@ services:
       BLOCK_SIZE: "4"    # 每块词元数
       NUM_BLOCKS: "32"   # 物理块总数（容量上限）
       SEED: "1234"       # 固定权重的随机种子
+      SPILL_DIR: "/app/spill"  # 暂停时 KV 快照落盘目录
+    volumes:
+      - spill-data:/app/spill  # 容器重启后暂存文件仍在，同一次服务运行内可恢复
     restart: unless-stopped
+
+volumes:
+  spill-data:

@@ -1,7 +1,12 @@
-"""FastAPI 应用：会话/分叉/追加/预测/关闭/占用统计的 HTTP 接口 + 单页网页。
+"""FastAPI 应用：会话/分叉/追加/预测/关闭/暂停到磁盘/恢复/占用统计 + 单页网页。
 
 追加、分叉、关闭都是同步视图函数（FastAPI 在线程池中执行），
 引擎内部用一把锁串行化状态变更，保证并发追加的原子性。
+
+暂停分三步：``begin_spill``（锁内拍快照）-> ``write_snapshot``（锁外写盘）
+-> ``commit_spill``（锁内校验版本并释放块）。写盘期间不持有引擎锁，
+其他会话照常读写；若本会话在写盘期间被改动，提交时整次暂停作废。
+恢复同样先锁外读文件校验，再锁内一次性分配块与重建分支表。
 """
 from __future__ import annotations
 
@@ -13,7 +18,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from .blocks import CapacityError
-from .engine import Engine, NotFoundError, ValidationError
+from .engine import (ConflictError, Engine, NotFoundError, ValidationError)
+from .spill import SpillError
 
 STATIC = Path(__file__).parent / "static" / "index.html"
 
@@ -40,6 +46,7 @@ def _engine_from_env() -> Engine:
         block_size=int(os.getenv("BLOCK_SIZE", "4")),
         num_blocks=int(os.getenv("NUM_BLOCKS", "32")),
         seed=int(os.getenv("SEED", "1234")),
+        spill_dir=os.getenv("SPILL_DIR") or None,
     )
 
 
@@ -57,8 +64,20 @@ def create_app(engine: Engine | None = None) -> FastAPI:
         return JSONResponse({"detail": str(exc)}, status_code=400)
 
     @app.exception_handler(CapacityError)
-    async def _409(_: Request, exc: CapacityError):
-        return JSONResponse({"detail": str(exc)}, status_code=409)
+    async def _409_capacity(_: Request, exc: CapacityError):
+        return JSONResponse({"detail": str(exc), "reason": "capacity"},
+                            status_code=409)
+
+    @app.exception_handler(ConflictError)
+    async def _409_conflict(_: Request, exc: ConflictError):
+        return JSONResponse({"detail": str(exc), "reason": "conflict"},
+                            status_code=409)
+
+    @app.exception_handler(SpillError)
+    async def _409_spill(_: Request, exc: SpillError):
+        # 写盘/读盘失败的详细信息原样返回，页面据此说明原因并可重试
+        return JSONResponse({"detail": str(exc), "reason": "spill"},
+                            status_code=409)
 
     @app.get("/", include_in_schema=False)
     def index():
@@ -96,6 +115,27 @@ def create_app(engine: Engine | None = None) -> FastAPI:
     def close_branch(session_id: str, branch_id: str):
         return eng.close_branch(session_id, branch_id)
 
+    @app.post("/api/sessions/{session_id}/pause")
+    def pause(session_id: str):
+        """锁内拍快照，锁外写盘，锁内提交；中途会话有变则作废。"""
+        job = eng.begin_spill(session_id)
+        try:
+            stored = eng.write_snapshot(job)   # 不持有引擎锁
+            return eng.commit_spill(session_id, job.id, stored)
+        except BaseException:
+            eng.abort_spill(session_id, job.id)
+            raise
+
+    @app.post("/api/sessions/{session_id}/resume")
+    def resume(session_id: str):
+        """先锁外读文件并校验，再锁内分配块与重建会话。"""
+        detail = eng.get_session(session_id)
+        if not detail.get("spill"):
+            raise ConflictError("该会话没有可恢复的暂存文件")
+        loaded = eng.load_spill(detail["spill"]["path"])  # 不持有引擎锁
+        return eng.restore_session(detail["spill"]["path"], loaded,
+                                   session_id=session_id)
+
     @app.get("/api/stats")
     def stats():
         return eng.stats()
@@ -104,3 +144,4 @@ def create_app(engine: Engine | None = None) -> FastAPI:
 
 
 app = create_app()
+

@@ -46,6 +46,17 @@
   .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .pill { display:inline-block; background:#eff1f3; border-radius:10px; padding:1px 8px;
           font-size:12px; margin-right:4px; }
+  .state { display:inline-block; border-radius:10px; padding:1px 8px; font-size:12px;
+           border:1px solid var(--bd); }
+  .state.paused { background:#fff8c5; border-color:#d4a72c; color:#7d4e00; }
+  .state.pausing { background:#ddf4ff; border-color:#0969da; color:#0969da; }
+  .state.resident { background:#dafbe1; border-color:#1a7f37; color:#1a7f37; }
+  .err { background:#ffebe9; border:1px solid #cf222e; color:#cf222e; border-radius:6px;
+         padding:8px 10px; margin:8px 0; font-size:12px; line-height:1.5; }
+  .spill-box { background:#f6f8fa; border:1px dashed var(--bd); border-radius:6px;
+               padding:8px 10px; margin:8px 0; font-size:12px; line-height:1.6;
+               word-break:break-all; }
+  tr.dim td { color:#8c959f; }
 </style>
 </head>
 <body>
@@ -78,10 +89,12 @@
       <button id="btn-fork" class="ghost">在此处分叉</button>
       <button id="btn-close" class="danger">关闭该分支</button>
     </div>
+    <div class="muted" style="margin-top:6px">会话级暂停/恢复入口在下方每个会话卡片标题旁。</div>
   </section>
 
   <section>
     <h2>会话与分支</h2>
+    <div id="session-msg"></div>
     <div id="sessions"><span class="muted">暂无会话</span></div>
   </section>
 
@@ -157,10 +170,27 @@ async function renderSessions(list) {
   box.innerHTML = '';
   for (const s of list) {
     const detail = await api(`/api/sessions/${s.session_id}`);
+    const paused = detail.state === 'paused';
     const card = document.createElement('div');
     card.style.marginBottom = '12px';
+    const stateLabel = {resident: '在内存', pausing: '写盘中', paused: '已暂停'}[detail.state]
+                        || detail.state;
     let html = `<h3>会话 <code>${s.session_id}</code>
-      <button class="ghost" data-del-session="${s.session_id}" style="float:right">删除会话</button></h3>`;
+      <span class="state ${detail.state}">${stateLabel}</span>
+      <button class="ghost" data-del-session="${s.session_id}" style="float:right">删除会话</button>
+      ${paused
+        ? `<button class="ghost" data-resume-session="${s.session_id}"
+             style="float:right;margin-right:8px">从磁盘恢复</button>`
+        : `<button class="ghost" data-pause-session="${s.session_id}"
+             style="float:right;margin-right:8px">暂停到磁盘</button>`}
+      </h3>`;
+    if (paused && detail.spill) {
+      const sp = detail.spill;
+      html += `<div class="spill-box">暂存文件：<code>${sp.path}</code><br>
+        唯一块 ${sp.unique_blocks} 个（共享块只存一份）· 块引用 ${sp.total_block_refs} 次
+        · 文件 ${(sp.file_size/1024).toFixed(1)} KB<br>
+        SHA-256 <code>${sp.digest.slice(0, 16)}…</code></div>`;
+    }
     if (!detail.branches.length) {
       html += '<div class="muted">（无分支）</div>';
     } else {
@@ -172,11 +202,11 @@ async function renderSessions(list) {
             `<span class="muted" title="${b.prediction.top.map(t=>t.token+': '+(t.prob*100).toFixed(1)+'%').join('  ')}">　top5⯈</span>`
           : '<span class="muted">—</span>';
         const isSel = selected && selected.branchId === b.id;
-        html += `<tr class="${isSel ? 'sel' : ''}">
-          <td><button class="ghost" data-sel="${s.session_id}|${b.id}|${b.name}">${isSel ? '✔' : '选择'}</button></td>
+        html += `<tr class="${isSel ? 'sel' : ''}${paused ? ' dim' : ''}">
+          <td><button class="ghost" data-sel="${s.session_id}|${b.id}|${b.name}" ${paused ? 'disabled' : ''}>${isSel ? '✔' : '选择'}</button></td>
           <td><code>${b.name}</code></td><td>${b.length}</td>
           <td>${b.tokens.map(t=>`<span class="pill">${t}</span>`).join('')}</td>
-          <td>${b.block_ids.map(i=>`#${i}`).join(' ') || '—'}</td>
+          <td>${b.block_ids.map(i=>`#${i}`).join(' ') || (paused ? '已落盘，不占块' : '—')}</td>
           <td>${p}</td></tr>`;
       }
       html += '</table>';
@@ -184,6 +214,16 @@ async function renderSessions(list) {
     card.innerHTML = html;
     box.appendChild(card);
   }
+}
+
+function showSessionMsg(msg) {
+  const box = document.getElementById('session-msg');
+  if (!msg) { box.innerHTML = ''; return; }
+  box.innerHTML = `<div class="err">${msg}</div>`;
+}
+
+function errText(err, extra='') {
+  return `${err.message}${extra ? `<br><span class="muted">${extra}</span>` : ''}`;
 }
 
 document.addEventListener('click', async e => {
@@ -195,6 +235,46 @@ document.addEventListener('click', async e => {
       document.getElementById('action-panel').style.display = 'block';
       document.getElementById('sel-label').textContent = `${label}（会话 ${sessionId}）`;
       refresh();
+    } else if (t.dataset.resumeSession) {
+      const sid = t.dataset.resumeSession;
+      t.disabled = true;
+      t.textContent = '恢复中…';
+      try {
+        const r = await api(`/api/sessions/${sid}/resume`, {method: 'POST'});
+        showSessionMsg('');
+        toast(`已恢复，重新占用 ${r.restored_blocks} 个块，分支可继续续写`, true);
+        if (selected && selected.sessionId === sid) {
+          document.getElementById('action-panel').style.display = 'none';
+          selected = null;
+        }
+      } catch (err) {
+        showSessionMsg(errText(err,
+          `会话 ${sid} 保持暂停、不占块；释放其他会话的块后可直接重试恢复。`));
+        toast(err.message);
+      } finally {
+        t.disabled = false;
+        refresh();
+      }
+    } else if (t.dataset.pauseSession) {
+      const sid = t.dataset.pauseSession;
+      t.disabled = true;
+      t.textContent = '写盘中…';
+      showSessionMsg('');
+      try {
+        const r = await api(`/api/sessions/${sid}/pause`, {method: 'POST'});
+        toast(`已暂停，释放 ${r.freed_blocks} 个块（共享块只存一份）`, true);
+        if (selected && selected.sessionId === sid) {
+          document.getElementById('action-panel').style.display = 'none';
+          selected = null;
+        }
+      } catch (err) {
+        showSessionMsg(errText(err,
+          `会话 ${sid} 与块占用保持原状，可直接重试暂停。`));
+        toast(err.message);
+      } finally {
+        t.disabled = false;
+        refresh();
+      }
     } else if (t.dataset.delSession) {
       await api(`/api/sessions/${t.dataset.delSession}`, {method: 'DELETE'});
       selected = null;
